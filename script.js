@@ -146,13 +146,24 @@ async function handleGenerate() {
         updateLoadingMessage('Uploading and processing... This usually takes 30-40 seconds');
         startProgressTimer();
 
-        console.log('Starting process for:', selectedFile.name);
+        console.log('=== STEP 1: Converting file to base64 ===');
+        console.log('File info:', {
+            name: selectedFile.name,
+            size: selectedFile.size,
+            type: selectedFile.type
+        });
         
         const base64 = await fileToBase64(selectedFile);
+        console.log('✓ Base64 conversion successful, length:', base64.length);
+        
+        console.log('=== STEP 2: Sending to server ===');
         const result = await processImage(base64);
         
         stopProgressTimer();
-        console.log('Success! Result:', result.result);
+        console.log('=== STEP 3: Success! ===');
+        console.log('Result URL:', result.result);
+        console.log('Upload URL:', result.uploadedUrl);
+        console.log('Timing:', result.timing);
         
         resultImageUrl = result.result;
         resultImage.src = result.result;
@@ -160,7 +171,11 @@ async function handleGenerate() {
         resultSection.classList.remove('hidden');
 
     } catch (error) {
-        console.error('Error:', error);
+        console.error('=== ERROR OCCURRED ===');
+        console.error('Error type:', error.name);
+        console.error('Error message:', error.message);
+        console.error('Full error:', error);
+        
         stopProgressTimer();
         processingLoader.classList.add('hidden');
         uploadSection.classList.remove('hidden');
@@ -168,45 +183,91 @@ async function handleGenerate() {
     }
 }
 
-// Process via Railway server (NO TIMEOUT!)
+// Process via Railway server with enhanced debugging
 async function processImage(base64) {
     try {
+        console.log('→ Preparing request payload...');
+        const payload = {
+            image: base64.split(',')[1],
+            filename: selectedFile.name,
+            mimetype: selectedFile.type
+        };
+        console.log('→ Payload size:', JSON.stringify(payload).length, 'bytes');
+        
+        console.log('→ Sending POST to /api/process...');
+        const startTime = Date.now();
+        
         const response = await fetch('/api/process', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({
-                image: base64.split(',')[1],
-                filename: selectedFile.name,
-                mimetype: selectedFile.type
-            })
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(120000) // 2 minute timeout
         });
 
-        console.log('API response status:', response.status);
+        const requestTime = Date.now() - startTime;
+        console.log('→ Response received in', requestTime, 'ms');
+        console.log('→ Response status:', response.status, response.statusText);
+        console.log('→ Response headers:', {
+            contentType: response.headers.get('content-type'),
+            contentLength: response.headers.get('content-length')
+        });
 
+        // Check content type
         const contentType = response.headers.get('content-type');
         if (!contentType || !contentType.includes('application/json')) {
+            console.error('❌ Non-JSON response received!');
             const text = await response.text();
-            console.error('Non-JSON response:', text);
-            throw new Error('Server returned invalid response');
+            console.error('Response body:', text.substring(0, 500));
+            throw new Error('Server returned invalid response (not JSON)');
         }
 
+        // Parse response
+        console.log('→ Parsing JSON response...');
         const data = await response.json();
+        console.log('→ Parsed data:', data);
 
-        if (!response.ok || !data.success) {
+        // Check if response is OK
+        if (!response.ok) {
+            console.error('❌ HTTP error:', response.status);
+            console.error('Error data:', data);
+            throw new Error(data.message || `Server error (${response.status})`);
+        }
+
+        // Check if success
+        if (!data.success) {
+            console.error('❌ API returned success: false');
             throw new Error(data.message || 'Processing failed');
         }
 
+        // Check if result exists
         if (!data.result) {
+            console.error('❌ No result URL in response');
             throw new Error('No result from API');
         }
 
-        console.log('Timing:', data.timing);
+        // Validate result URL
+        if (!data.result.startsWith('http')) {
+            console.error('❌ Invalid result URL:', data.result);
+            throw new Error('Invalid result URL from API');
+        }
+
+        console.log('✓ All validations passed!');
         return data;
         
     } catch (error) {
-        console.error('Process error:', error);
+        if (error.name === 'AbortError') {
+            console.error('❌ Request timeout after 2 minutes');
+            throw new Error('Processing took too long (>2 min). Try a smaller image.');
+        }
+        
+        if (error.name === 'TypeError' && error.message.includes('fetch')) {
+            console.error('❌ Network error - cannot reach server');
+            throw new Error('Cannot connect to server. Check your internet connection.');
+        }
+        
+        console.error('❌ Unexpected error:', error);
         throw error;
     }
 }
@@ -214,10 +275,13 @@ async function processImage(base64) {
 function fileToBase64(file) {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
+        reader.onload = () => {
+            console.log('✓ FileReader completed');
+            resolve(reader.result);
+        };
         reader.onerror = (error) => {
-            console.error('FileReader error:', error);
-            reject(error);
+            console.error('❌ FileReader error:', error);
+            reject(new Error('Failed to read file: ' + error.message));
         };
         reader.readAsDataURL(file);
     });
@@ -238,8 +302,10 @@ function startProgressTimer() {
             loadingText.textContent = `Processing... ${seconds}s (usually 30-40s)`;
         } else if (seconds <= 55) {
             loadingText.textContent = `Still processing... ${seconds}s. Almost done!`;
-        } else {
+        } else if (seconds <= 90) {
             loadingText.textContent = `Taking longer... ${seconds}s. Please wait...`;
+        } else {
+            loadingText.textContent = `This is taking unusually long (${seconds}s). Check console for errors.`;
         }
     }, 1000);
 }
@@ -251,20 +317,16 @@ function stopProgressTimer() {
     }
 }
 
-// Native browser download dengan progress bar
+// Native browser download
 function handleDownload() {
     if (!resultImageUrl) return;
 
     try {
         console.log('Starting download...');
         
-        // Generate random filename (8 karakter acak)
         const randomName = generateRandomFilename();
-        
-        // Native browser download - akan muncul progress bar di browser
         const downloadUrl = `/api/download?url=${encodeURIComponent(resultImageUrl)}&filename=${randomName}`;
         
-        // Buat link dan klik - trigger native download dengan progress
         const a = document.createElement('a');
         a.href = downloadUrl;
         a.download = randomName;
@@ -272,14 +334,13 @@ function handleDownload() {
         a.click();
         document.body.removeChild(a);
         
-        console.log('Download started:', randomName);
+        console.log('Download initiated:', randomName);
     } catch (error) {
         console.error('Download error:', error);
         showError('Failed to start download. Please try again.');
     }
 }
 
-// Generate random filename
 function generateRandomFilename() {
     const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
     let random = '';
@@ -311,4 +372,4 @@ function showError(message) {
 
 function hideError() {
     errorMessage.classList.add('hidden');
-}
+            }
